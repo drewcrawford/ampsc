@@ -1,0 +1,11 @@
+[package]
+name = "ampsc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+atomiclock_async = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/atomiclock_async.git"}
+with_waker = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/with_waker.git"}
+
+[dev-dependencies]
+afut = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/afut.git"}
