@@ -8,6 +8,7 @@ mean to target a different API.
 use std::sync::Arc;
 use std::task::{Waker};
 
+#[derive(Debug)]
 struct Locked<T> {
     data: Option<T>,
     pending_producers: Vec<Waker>,
@@ -23,6 +24,7 @@ impl<T> Locked<T> {
     }
 }
 
+#[derive(Debug)]
 struct Shared<T> {
     //todo: optimize
     data: atomiclock_async::AtomicLockAsync<Locked<T>>,
@@ -38,6 +40,7 @@ pub fn channel<T>() -> (ChannelProducer<T>, ChannelConsumer<T>) {
     (ChannelProducer { shared: shared.clone() }, ChannelConsumer { shared })
 }
 
+#[derive(Debug)]
 pub struct ChannelConsumer<T> {
     shared: Arc<Shared<T>>,
 }
@@ -45,7 +48,7 @@ pub struct ChannelConsumer<T> {
 
 
 impl<T> ChannelConsumer<T> {
-    pub async fn receive(&self) -> T {
+    pub async fn receive(&mut self) -> T {
         loop {
             let mut lock = self.shared.data.lock().await;
             match lock.data.take() {
@@ -69,12 +72,13 @@ impl<T> ChannelConsumer<T> {
     }
 }
 
+#[derive(Debug,Clone)]
 pub struct ChannelProducer<T> {
     shared: Arc<Shared<T>>,
 }
 
 impl<T> ChannelProducer<T> {
-    pub async fn send(&self, data: T) {
+    pub async fn send(&mut self, data: T) {
         let mut lock = self.shared.data.lock().await;
         match lock.data.as_ref() {
             Some(_) => {
@@ -92,10 +96,25 @@ impl<T> ChannelProducer<T> {
     }
 }
 
+/*
+boilerplate.
+
+1.  Can't clone a consumer, only producer
+2.  No copy
+3.  We could in theory implement PartialEq/Eq based on same channel, but not sure how critical that is
+4.  No ordering
+5.  Don't think hash makes a ton of sense for this type, but we could do it based on eq I guess
+6.  Default doesn't really make sense for either type, they're created as a pair
+7.  Can't see a ton of value in display
+8.  In theory could support From/Into for crossing the pipe but might constrain perf somewhat
+9.  Not a pointer to anything
+10.
+ */
+
 
 
 #[test] fn test_push() {
-    let (producer,consumer) = channel();
+    let (mut producer,mut consumer) = channel();
     afut::block_on::spin_on(producer.send(1));
     let r = afut::block_on::spin_on(consumer.receive());
     assert_eq!(r,1);
