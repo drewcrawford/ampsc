@@ -28,30 +28,14 @@ struct Shared<T> {
     data: atomiclock_async::AtomicLockAsync<Locked<T>>,
 }
 
-
-struct Channel<T> {
-    shared: Arc<Shared<T>>,
-}
-
-impl<T> Channel<T> {
-    pub fn new() -> Self {
-        Channel {
-            shared: Arc::new(Shared {
-                data: atomiclock_async::AtomicLockAsync::new(Locked::new()),
-            }),
-        }
-    }
-    pub fn producer(&self) -> ChannelProducer<T> {
-        ChannelProducer {
-            shared: self.shared.clone(),
-        }
-    }
-
-    pub fn consumer(self) -> ChannelConsumer<T> {
-        ChannelConsumer {
-            shared: self.shared,
-        }
-    }
+/**
+Creates a new channel.
+*/
+pub fn channel<T>() -> (ChannelProducer<T>, ChannelConsumer<T>) {
+    let shared = Arc::new(Shared {
+        data: atomiclock_async::AtomicLockAsync::new(Locked::new()),
+    });
+    (ChannelProducer { shared: shared.clone() }, ChannelConsumer { shared })
 }
 
 pub struct ChannelConsumer<T> {
@@ -111,9 +95,7 @@ impl<T> ChannelProducer<T> {
 
 
 #[test] fn test_push() {
-    let channel = Channel::new();
-    let producer = channel.producer();
-    let consumer = channel.consumer();
+    let (producer,consumer) = channel();
     afut::block_on::spin_on(producer.send(1));
     let r = afut::block_on::spin_on(consumer.receive());
     assert_eq!(r,1);
