@@ -72,7 +72,7 @@ impl<T> ChannelConsumer<T> {
     }
 }
 
-#[derive(Debug,Clone)]
+#[derive(Debug)]
 pub struct ChannelProducer<T> {
     shared: Arc<Shared<T>>,
 }
@@ -111,7 +111,13 @@ boilerplate.
 10.
  */
 
-
+impl<T> Clone for ChannelProducer<T> {
+    fn clone(&self) -> Self {
+        ChannelProducer {
+            shared: self.shared.clone(),
+        }
+    }
+}
 
 #[test] fn test_push() {
     let (mut producer,mut consumer) = channel();
