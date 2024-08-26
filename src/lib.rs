@@ -4,7 +4,7 @@ A multi-producer, single-consumer async stream channel.
 This channel guarantees reliable delivery.  If you can live with alternate guarantees, you probably
 mean to target a different API.
 */
-
+use dlog::perfwarn;
 use std::sync::Arc;
 use std::task::{Waker};
 
@@ -27,15 +27,18 @@ impl<T> Locked<T> {
 #[derive(Debug)]
 struct Shared<T> {
     //todo: optimize
-    data: atomiclock_async::AtomicLockAsync<Locked<T>>,
+    optimize_data: atomiclock_async::AtomicLockAsync<Locked<T>>,
 }
 
 /**
 Creates a new channel.
 */
 pub fn channel<T>() -> (ChannelProducer<T>, ChannelConsumer<T>) {
+    let lock = dlog::perfwarn!("data field may need optimization", {
+        atomiclock_async::AtomicLockAsync::new(Locked::new())
+    });
     let shared = Arc::new(Shared {
-        data: atomiclock_async::AtomicLockAsync::new(Locked::new()),
+        optimize_data: lock,
     });
     (ChannelProducer { shared: shared.clone() }, ChannelConsumer { shared })
 }
@@ -50,21 +53,24 @@ pub struct ChannelConsumer<T> {
 impl<T> ChannelConsumer<T> {
     pub async fn receive(&mut self) -> T {
         loop {
-            let mut lock = self.shared.data.lock().await;
-            match lock.data.take() {
-                Some(data) => {
-                    if let Some(producer) = lock.pending_producers.pop() {
-                        drop(lock);
-                        producer.wake();
+            perfwarn!("data field may need optimization", {
+                let mut lock = self.shared.optimize_data.lock().await;
+                match lock.data.take() {
+                    Some(data) => {
+                        if let Some(producer) = lock.pending_producers.pop() {
+                            drop(lock);
+                            producer.wake();
+                        }
+                        return data
                     }
-                    return data
+                    None => {
+                        let current_waker = with_waker::WithWaker::new().await;
+                        lock.pending_consumer = Some(current_waker);
+                        //try again
+                    }
                 }
-                None => {
-                    let current_waker = with_waker::WithWaker::new().await;
-                    lock.pending_consumer = Some(current_waker);
-                    //try again
-                }
-            }
+            })
+
         }
 
 
@@ -79,20 +85,23 @@ pub struct ChannelProducer<T> {
 
 impl<T> ChannelProducer<T> {
     pub async fn send(&mut self, data: T) {
-        let mut lock = self.shared.data.lock().await;
-        match lock.data.as_ref() {
-            Some(_) => {
-                let current_waker = with_waker::WithWaker::new().await;
-                lock.pending_producers.push(current_waker);
-            }
-            None => {
-                lock.data = Some(data);
-                if let Some(consumer) = lock.pending_consumer.take() {
-                    drop(lock);
-                    consumer.wake();
+        perfwarn!("data field may need optimization", {
+            let mut lock = self.shared.optimize_data.lock().await;
+            match lock.data.as_ref() {
+                Some(_) => {
+                    let current_waker = with_waker::WithWaker::new().await;
+                    lock.pending_producers.push(current_waker);
+                }
+                None => {
+                    lock.data = Some(data);
+                    if let Some(consumer) = lock.pending_consumer.take() {
+                        drop(lock);
+                        consumer.wake();
+                    }
                 }
             }
-        }
+        });
+
     }
 }
 
