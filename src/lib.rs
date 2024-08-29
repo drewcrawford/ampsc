@@ -4,9 +4,12 @@ A multi-producer, single-consumer async stream channel.
 This channel guarantees reliable delivery.  If you can live with alternate guarantees, you probably
 mean to target a different API.
 */
+
+use std::future::Future;
+use std::pin::Pin;
 use dlog::perfwarn;
 use std::sync::Arc;
-use std::task::{Waker};
+use std::task::{Context, Poll, Waker};
 
 #[derive(Debug)]
 struct Locked<T> {
@@ -83,16 +86,27 @@ pub struct ChannelProducer<T> {
     shared: Arc<Shared<T>>,
 }
 
-impl<T> ChannelProducer<T> {
-    pub async fn send(&mut self, data: T) {
-        perfwarn!("data field may need optimization", {
-            let mut lock = self.shared.optimize_data.lock().await;
+#[derive(Debug)]
+pub struct ChannelProducerSendFuture<'a,T> {
+    inner: &'a mut ChannelProducer<T>,
+    data: Option<T>,
+}
+
+impl<'a, T> Future for ChannelProducerSendFuture<'a, T> where T: Unpin {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut_self = self.get_mut();
+        let pinned = std::pin::pin!(async {
+            perfwarn!("data field may need optimization", {
+            let mut lock = mut_self.inner.shared.optimize_data.lock().await;
             match lock.data.as_ref() {
                 Some(_) => {
                     let current_waker = with_waker::WithWaker::new().await;
                     lock.pending_producers.push(current_waker);
                 }
                 None => {
+                        let data = mut_self.data.take().expect("data should be present");
                     lock.data = Some(data);
                     if let Some(consumer) = lock.pending_consumer.take() {
                         drop(lock);
@@ -101,6 +115,17 @@ impl<T> ChannelProducer<T> {
                 }
             }
         });
+        });
+        pinned.poll(cx)
+    }
+}
+
+impl<T> ChannelProducer<T> {
+    pub fn send(&mut self, data: T) -> ChannelProducerSendFuture<T> {
+        ChannelProducerSendFuture {
+            inner: self,
+            data: Some(data),
+        }
 
     }
 }
