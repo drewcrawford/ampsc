@@ -9,13 +9,23 @@ use std::future::Future;
 use std::pin::Pin;
 use dlog::perfwarn;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::task::{Context, Poll, Waker};
+use async_drop::{AsyncDrop, PhantomDontSyncDrop};
+
+#[derive(thiserror::Error, Debug)]
+pub enum SendError {
+    #[error("The consumer has hung up")]
+    ConsumerHangup,
+}
 
 #[derive(Debug)]
 struct Locked<T> {
     data: Option<T>,
     pending_producers: Vec<Waker>,
     pending_consumer: Option<Waker>,
+    consumer_hangup: bool,
+
 }
 impl<T> Locked<T> {
     fn new() -> Locked<T> {
@@ -23,6 +33,7 @@ impl<T> Locked<T> {
             data: None,
             pending_producers: Vec::new(),
             pending_consumer: None,
+            consumer_hangup: false,
         }
     }
 }
@@ -43,14 +54,14 @@ pub fn channel<T>() -> (ChannelProducer<T>, ChannelConsumer<T>) {
     let shared = Arc::new(Shared {
         optimize_data: lock,
     });
-    (ChannelProducer { shared: shared.clone() }, ChannelConsumer { shared })
+    (ChannelProducer { shared: shared.clone() }, ChannelConsumer { shared, _phantom_dont_sync_drop: PhantomDontSyncDrop::new() })
 }
 
 #[derive(Debug)]
 pub struct ChannelConsumer<T> {
     shared: Arc<Shared<T>>,
+    _phantom_dont_sync_drop: PhantomDontSyncDrop,
 }
-
 
 
 impl<T> ChannelConsumer<T> {
@@ -73,11 +84,35 @@ impl<T> ChannelConsumer<T> {
                     }
                 }
             })
-
         }
+    }
+}
 
+pub struct ConsumerDropFuture<T> {
+    inner: ChannelConsumer<T>,
+}
 
+impl<T> Future for ConsumerDropFuture<T> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut_self = self.get_mut();
+        let pinned = std::pin::pin!(async {
+            perfwarn!("data field may need optimization", {
+            let mut lock = mut_self.inner.shared.optimize_data.lock().await;
+            lock.consumer_hangup = true;
+            lock.pending_producers.pop().map(|e| e.wake());
+                mut_self.inner._phantom_dont_sync_drop.mark_async_dropped();
+        });
+        });
+        pinned.poll(cx)
+    }
+}
 
+impl<T> async_drop::AsyncDrop for ChannelConsumer<T> {
+    type Future = ConsumerDropFuture<T>;
+
+    fn async_drop(self) -> ConsumerDropFuture<T> {
+        ConsumerDropFuture { inner: self }
     }
 }
 
@@ -87,38 +122,43 @@ pub struct ChannelProducer<T> {
 }
 
 #[derive(Debug)]
-pub struct ChannelProducerSendFuture<'a,T> {
+pub struct ChannelProducerSendFuture<'a, T> {
     inner: &'a mut ChannelProducer<T>,
     data: Option<T>,
 }
 
-impl<'a, T> Future for ChannelProducerSendFuture<'a, T> where T: Unpin {
-    type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut_self = self.get_mut();
-        let pinned = std::pin::pin!(async {
-            perfwarn!("data field may need optimization", {
-            let mut lock = mut_self.inner.shared.optimize_data.lock().await;
-            match lock.data.as_ref() {
-                Some(_) => {
-                    let current_waker = with_waker::WithWaker::new().await;
-                    lock.pending_producers.push(current_waker);
-                }
-                None => {
-                        let data = mut_self.data.take().expect("data should be present");
-                    lock.data = Some(data);
-                    if let Some(consumer) = lock.pending_consumer.take() {
-                        drop(lock);
-                        consumer.wake();
-                    }
-                }
+
+impl<'a, T> Future for ChannelProducerSendFuture<'a, T>
+where
+    T: Unpin,
+{
+    type Output = Result<(), SendError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let take_data = self.data.take().expect("Data to send");
+        let move_waker = cx.waker();
+        let pinned = std::pin::pin!(poll_escape::PollEscape::escape( async {
+            let mut lock = self.inner.shared.optimize_data.lock().await;
+            if lock.consumer_hangup {
+                return poll_escape::Poll::Ready(Err(SendError::ConsumerHangup));
             }
-        });
-        });
+            if let Some(data) = lock.data.as_ref() {
+                lock.pending_producers.push(move_waker.clone());
+                return poll_escape::Poll::Escape;
+            }
+            else {
+                lock.data = Some(take_data);
+                lock.pending_consumer.take().map(|e| e.wake());
+                poll_escape::Poll::Ready(Ok(()))
+            }
+        }));
         pinned.poll(cx)
+
     }
 }
+
+
 
 impl<T> ChannelProducer<T> {
     pub fn send(&mut self, data: T) -> ChannelProducerSendFuture<T> {
@@ -126,7 +166,6 @@ impl<T> ChannelProducer<T> {
             inner: self,
             data: Some(data),
         }
-
     }
 }
 
@@ -153,10 +192,11 @@ impl<T> Clone for ChannelProducer<T> {
     }
 }
 
-#[test] fn test_push() {
-    let (mut producer,mut consumer) = channel();
+#[test]
+fn test_push() {
+    let (mut producer, mut consumer) = channel();
     afut::block_on::spin_on(producer.send(1));
     let r = afut::block_on::spin_on(consumer.receive());
-    assert_eq!(r,1);
-
+    afut::block_on::spin_on(consumer.async_drop());
+    assert_eq!(r, 1);
 }
