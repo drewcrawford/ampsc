@@ -7,10 +7,9 @@ mean to target a different API.
 
 use std::future::Future;
 use std::pin::Pin;
-use dlog::perfwarn;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Poll, Waker};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::task::{Context, Poll};
 
 #[derive(thiserror::Error, Debug)]
 pub enum SendError {
@@ -18,17 +17,21 @@ pub enum SendError {
     ConsumerHangup,
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum RecvError {
+    #[error("The producer has hung up")]
+    ProducerHangup,
+}
+
 #[derive(Debug)]
 struct Locked<T> {
     data: Option<T>,
-    pending_consumer: Option<Waker>,
 
 }
 impl<T> Locked<T> {
     fn new() -> Locked<T> {
         Locked {
             data: None,
-            pending_consumer: None,
         }
     }
 }
@@ -38,7 +41,9 @@ struct Shared<T> {
     //todo: optimize
     optimize_data: atomiclock_async::AtomicLockAsync<Locked<T>>,
     consumer_hangup: AtomicBool,
+    producer_hangup: AtomicU8,
     pending_producers: wakelist::WakeList,
+    pending_consumer: wakelist::WakeOne,
 }
 
 /**
@@ -52,6 +57,8 @@ pub fn channel<T>() -> (ChannelProducer<T>, ChannelConsumer<T>) {
         optimize_data: lock,
         consumer_hangup: AtomicBool::new(false),
         pending_producers: wakelist::WakeList::new(),
+        producer_hangup: AtomicU8::new(1),
+        pending_consumer: wakelist::WakeOne::new(),
     });
     (ChannelProducer { shared: shared.clone() }, ChannelConsumer { shared })
 }
@@ -61,24 +68,38 @@ pub struct ChannelConsumer<T> {
     shared: Arc<Shared<T>>,
 }
 
+pub struct ChannelConsumerRecvFuture<'a, T> {
+    inner: &'a mut ChannelConsumer<T>,
+}
+
+impl <'a, T> Future for ChannelConsumerRecvFuture<'a, T> {
+    type Output = Result<T,RecvError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let move_waker = cx.waker();
+        let pinned = std::pin::pin!(poll_escape::PollEscape::escape( async {
+            if self.inner.shared.producer_hangup.load(Ordering::Relaxed) == 0 {
+                return poll_escape::Poll::Ready(Err(RecvError::ProducerHangup));
+            }
+            let mut lock = self.inner.shared.optimize_data.lock().await;
+            if let Some(data) = lock.data.take() {
+                self.inner.shared.pending_producers.wake_one();
+                return poll_escape::Poll::Ready(Ok(data));
+            }
+            else {
+                self.inner.shared.pending_consumer.push(move_waker.clone());
+                poll_escape::Poll::Escape
+            }
+        }));
+        pinned.poll(cx)
+    }
+}
+
 
 impl<T> ChannelConsumer<T> {
-    pub async fn receive(&mut self) -> T {
-        loop {
-            perfwarn!("data field may need optimization", {
-                let mut lock = self.shared.optimize_data.lock().await;
-                match lock.data.take() {
-                    Some(data) => {
-                        self.shared.pending_producers.wake_one();
-                        return data
-                    }
-                    None => {
-                        let current_waker = with_waker::WithWaker::new().await;
-                        lock.pending_consumer = Some(current_waker);
-                        //try again
-                    }
-                }
-            })
+    pub fn receive(&mut self) -> ChannelConsumerRecvFuture<'_, T> {
+        ChannelConsumerRecvFuture {
+            inner: self,
         }
     }
 }
@@ -118,13 +139,13 @@ where
             if self.inner.shared.consumer_hangup.load(Ordering::Relaxed) {
                 return poll_escape::Poll::Ready(Err(SendError::ConsumerHangup));
             }
-            if let Some(data) = lock.data.as_ref() {
+            if let Some(_) = lock.data.as_ref() {
                 self.inner.shared.pending_producers.push(move_waker.clone());
                 return poll_escape::Poll::Escape;
             }
             else {
                 lock.data = Some(take_data);
-                lock.pending_consumer.take().map(|e| e.wake());
+                self.inner.shared.pending_consumer.wake();
                 poll_escape::Poll::Ready(Ok(()))
             }
         }));
@@ -161,8 +182,19 @@ boilerplate.
 
 impl<T> Clone for ChannelProducer<T> {
     fn clone(&self) -> Self {
+        //increment the producer hangup count
+        self.shared.producer_hangup.fetch_add(1, Ordering::Relaxed);
         ChannelProducer {
             shared: self.shared.clone(),
+        }
+    }
+}
+
+impl <T> Drop for ChannelProducer<T> {
+    fn drop(&mut self) {
+        let old = self.shared.producer_hangup.fetch_sub(1, Ordering::Relaxed);
+        if old == 1 {
+            self.shared.pending_consumer.wake();
         }
     }
 }
@@ -170,7 +202,7 @@ impl<T> Clone for ChannelProducer<T> {
 #[test]
 fn test_push() {
     let (mut producer, mut consumer) = channel();
-    afut::block_on::spin_on(producer.send(1));
-    let r = afut::block_on::spin_on(consumer.receive());
+    afut::block_on::spin_on(producer.send(1)).unwrap();
+    let r = afut::block_on::spin_on(consumer.receive()).unwrap();
     assert_eq!(r, 1);
 }
