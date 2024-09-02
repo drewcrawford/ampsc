@@ -9,9 +9,8 @@ use std::future::Future;
 use std::pin::Pin;
 use dlog::perfwarn;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
-use async_drop::{AsyncDrop, PhantomDontSyncDrop};
 
 #[derive(thiserror::Error, Debug)]
 pub enum SendError {
@@ -22,18 +21,14 @@ pub enum SendError {
 #[derive(Debug)]
 struct Locked<T> {
     data: Option<T>,
-    pending_producers: Vec<Waker>,
     pending_consumer: Option<Waker>,
-    consumer_hangup: bool,
 
 }
 impl<T> Locked<T> {
     fn new() -> Locked<T> {
         Locked {
             data: None,
-            pending_producers: Vec::new(),
             pending_consumer: None,
-            consumer_hangup: false,
         }
     }
 }
@@ -42,6 +37,8 @@ impl<T> Locked<T> {
 struct Shared<T> {
     //todo: optimize
     optimize_data: atomiclock_async::AtomicLockAsync<Locked<T>>,
+    consumer_hangup: AtomicBool,
+    pending_producers: wakelist::WakeList,
 }
 
 /**
@@ -53,14 +50,15 @@ pub fn channel<T>() -> (ChannelProducer<T>, ChannelConsumer<T>) {
     });
     let shared = Arc::new(Shared {
         optimize_data: lock,
+        consumer_hangup: AtomicBool::new(false),
+        pending_producers: wakelist::WakeList::new(),
     });
-    (ChannelProducer { shared: shared.clone() }, ChannelConsumer { shared, _phantom_dont_sync_drop: PhantomDontSyncDrop::new() })
+    (ChannelProducer { shared: shared.clone() }, ChannelConsumer { shared })
 }
 
 #[derive(Debug)]
 pub struct ChannelConsumer<T> {
     shared: Arc<Shared<T>>,
-    _phantom_dont_sync_drop: PhantomDontSyncDrop,
 }
 
 
@@ -71,10 +69,7 @@ impl<T> ChannelConsumer<T> {
                 let mut lock = self.shared.optimize_data.lock().await;
                 match lock.data.take() {
                     Some(data) => {
-                        if let Some(producer) = lock.pending_producers.pop() {
-                            drop(lock);
-                            producer.wake();
-                        }
+                        self.shared.pending_producers.wake_one();
                         return data
                     }
                     None => {
@@ -88,33 +83,13 @@ impl<T> ChannelConsumer<T> {
     }
 }
 
-pub struct ConsumerDropFuture<T> {
-    inner: ChannelConsumer<T>,
-}
-
-impl<T> Future for ConsumerDropFuture<T> {
-    type Output = ();
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut_self = self.get_mut();
-        let pinned = std::pin::pin!(async {
-            perfwarn!("data field may need optimization", {
-            let mut lock = mut_self.inner.shared.optimize_data.lock().await;
-            lock.consumer_hangup = true;
-            lock.pending_producers.pop().map(|e| e.wake());
-                mut_self.inner._phantom_dont_sync_drop.mark_async_dropped();
-        });
-        });
-        pinned.poll(cx)
+impl<T> Drop for ChannelConsumer<T> {
+    fn drop(&mut self) {
+        self.shared.consumer_hangup.store(true, std::sync::atomic::Ordering::Release);
+        self.shared.pending_producers.wake_all();
     }
 }
 
-impl<T> async_drop::AsyncDrop for ChannelConsumer<T> {
-    type Future = ConsumerDropFuture<T>;
-
-    fn async_drop(self) -> ConsumerDropFuture<T> {
-        ConsumerDropFuture { inner: self }
-    }
-}
 
 #[derive(Debug)]
 pub struct ChannelProducer<T> {
@@ -140,11 +115,11 @@ where
         let move_waker = cx.waker();
         let pinned = std::pin::pin!(poll_escape::PollEscape::escape( async {
             let mut lock = self.inner.shared.optimize_data.lock().await;
-            if lock.consumer_hangup {
+            if self.inner.shared.consumer_hangup.load(Ordering::Relaxed) {
                 return poll_escape::Poll::Ready(Err(SendError::ConsumerHangup));
             }
             if let Some(data) = lock.data.as_ref() {
-                lock.pending_producers.push(move_waker.clone());
+                self.inner.shared.pending_producers.push(move_waker.clone());
                 return poll_escape::Poll::Escape;
             }
             else {
@@ -197,6 +172,5 @@ fn test_push() {
     let (mut producer, mut consumer) = channel();
     afut::block_on::spin_on(producer.send(1));
     let r = afut::block_on::spin_on(consumer.receive());
-    afut::block_on::spin_on(consumer.async_drop());
     assert_eq!(r, 1);
 }

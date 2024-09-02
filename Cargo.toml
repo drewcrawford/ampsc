@@ -7,8 +7,9 @@ edition = "2021"
 atomiclock_async = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/atomiclock_async.git"}
 with_waker = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/with_waker.git"}
 dlog = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/dlog.git"}
-async-drop = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/async_drop.git"}
 poll_escape = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/poll_escape.git"}
+wakelist = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/wakelist.git"}
+
 thiserror = "*"
 
 [dev-dependencies]
