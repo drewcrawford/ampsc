@@ -87,7 +87,7 @@ impl <'a, T> Future for ChannelConsumerRecvFuture<'a, T> {
                 return poll_escape::Poll::Ready(Ok(data));
             }
             else {
-                self.inner.shared.pending_consumer.push(receiver.into_waker());
+                self.inner.shared.pending_consumer.push_if_empty(&receiver.into_waker());
                 poll_escape::Poll::Escape
             }
         }));
