@@ -76,8 +76,8 @@ impl <'a, T> Future for ChannelConsumerRecvFuture<'a, T> {
     type Output = Result<T,RecvError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let move_waker = cx.waker();
-        let pinned = std::pin::pin!(poll_escape::PollEscape::escape( async {
+        let (sender,receiver) = poll_escape::waker_escape::waker_escape();
+        let pinned = std::pin::pin!(poll_escape::PollEscape::escape(sender, async {
             if self.inner.shared.producer_hangup.load(Ordering::Relaxed) == 0 {
                 return poll_escape::Poll::Ready(Err(RecvError::ProducerHangup));
             }
@@ -87,7 +87,7 @@ impl <'a, T> Future for ChannelConsumerRecvFuture<'a, T> {
                 return poll_escape::Poll::Ready(Ok(data));
             }
             else {
-                self.inner.shared.pending_consumer.push(move_waker.clone());
+                self.inner.shared.pending_consumer.push(receiver.into_waker());
                 poll_escape::Poll::Escape
             }
         }));
@@ -133,14 +133,14 @@ where
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let take_data = self.data.take().expect("Data to send");
-        let move_waker = cx.waker();
-        let pinned = std::pin::pin!(poll_escape::PollEscape::escape( async {
+        let (sender,receiver) = poll_escape::waker_escape::waker_escape();
+        let pinned = std::pin::pin!(poll_escape::PollEscape::escape(sender, async {
             let mut lock = self.inner.shared.optimize_data.lock().await;
             if self.inner.shared.consumer_hangup.load(Ordering::Relaxed) {
                 return poll_escape::Poll::Ready(Err(SendError::ConsumerHangup));
             }
             if let Some(_) = lock.data.as_ref() {
-                self.inner.shared.pending_producers.push(move_waker.clone());
+                self.inner.shared.pending_producers.push(receiver.into_waker());
                 return poll_escape::Poll::Escape;
             }
             else {
