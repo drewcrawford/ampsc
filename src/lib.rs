@@ -83,7 +83,8 @@ impl <'a, T> Future for ChannelConsumerRecvFuture<'a, T> {
             }
             let mut lock = self.inner.shared.optimize_data.lock().await;
             if let Some(data) = lock.data.take() {
-                self.inner.shared.pending_producers.wake_one();
+                //it's ok to pop here because we always insert fresh wakers
+                self.inner.shared.pending_producers.wake_one_pop();
                 return poll_escape::Poll::Ready(Ok(data));
             }
             else {
@@ -107,7 +108,7 @@ impl<T> ChannelConsumer<T> {
 impl<T> Drop for ChannelConsumer<T> {
     fn drop(&mut self) {
         self.shared.consumer_hangup.store(true, std::sync::atomic::Ordering::Release);
-        self.shared.pending_producers.wake_all();
+        self.shared.pending_producers.wake_all_drain();
     }
 }
 
@@ -145,7 +146,7 @@ where
             }
             else {
                 lock.data = Some(take_data);
-                self.inner.shared.pending_consumer.wake();
+                self.inner.shared.pending_consumer.wake_by_ref();
                 poll_escape::Poll::Ready(Ok(()))
             }
         }));
@@ -194,7 +195,7 @@ impl <T> Drop for ChannelProducer<T> {
     fn drop(&mut self) {
         let old = self.shared.producer_hangup.fetch_sub(1, Ordering::Relaxed);
         if old == 1 {
-            self.shared.pending_consumer.wake();
+            self.shared.pending_consumer.wake_by_ref();
         }
     }
 }
