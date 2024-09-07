@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use dlog::perfwarn;
-use poll_escape::PollEscape;
+use poll_escape::PollEscapeSend;
 
 #[derive(thiserror::Error, Debug)]
 pub enum SendError {
@@ -26,58 +26,42 @@ pub enum RecvError {
     ProducerHangup,
 }
 
-#[derive(Debug)]
-struct Locked<T> {
-    data: Option<T>,
+type DataContinuation<T> = continuation::Sender<Result<T,RecvError>>;
 
-}
-impl<T> Locked<T> {
-    fn new() -> Locked<T> {
-        Locked {
-            data: None,
-        }
-    }
+/*
+You might imagine some better datastructure here, like what if we had atomics for insert and remove.
+
+Problems are.
+
+1.  We need to synchronize on both of these, not one or the other.
+2.  Reallocation.  Like on the one hand, one could imagine a fixed-sized buffer.  On some level, your whole computer is a fixed-size buffer, so there's always some upper limit.  On the other hand, maybe you wanted to use your memory for something else.
+3.  So maybe it occurs to you to use backpressure to store the spill.  But then you're trying to implement a channel in terms of a channel, which is a bit of a problem.
+ */
+#[derive(Debug)]
+pub struct Locked<T> {
+    pending_consumer: Option<DataContinuation<T>>,
+    pending_producers: Vec<continuation::Sender<DataContinuation<T>>>,
 }
 
 #[derive(Debug)]
 struct Shared<T> {
-    optimize_data: atomiclock_async::AtomicLockAsync<Locked<T>>,
+    //perfwarn - we want a nonblocking lock I think
+    perfwarn_locked: sync::Mutex<Locked<T>>,
     consumer_hangup: AtomicBool,
     producer_hangup: AtomicU8,
-    /*
-    you might imagine some kinda atomic solution here.
-     */
-    pending_consumer_perfwarn: sync::Mutex<Option<continuation::Sender<Result<(),RecvError>>>>,
-
-    /*
-    perfwarn!
-    You might expect this to be, say, some fast datastructure.  One idea you might have is that if only we had a kind of lock-free queue that was optimized for this type.
-    Reallocation is hard but we have an async context here, maybe we can use backpressure?  Maybe we split sender and receiver?  Behind this door you are trying to implement ampsc in terms of
-    this underlying channel, but that is the very channel you need to implement.
-
-    ok so we don't want to spill into the async context.  The other options are:
-
-    1.  Preallocate a fixed size buffer and hope we don't exceed it.  On the one hand, the memory in your system is a fixed-size buffer, there's always some upper limit.  On the other hand, maybe you wanted to use your memory, so wasting it is not ideal.
-    2.  Some kind of synchronous solution, like we mostly insert in a lock-free queue but there is a lock to handle reallocation.  Pin is a complication for reallocation, but I think continuation is usually unpin.  Anyway for this we probably want a generic solution with multiple uses.
-
-    Let's punt ont that and use a dumb mutex for now.
-     */
-    pending_producers_perfwarn: sync::Mutex<Vec<continuation::Sender<Result<(), SendError>>>>,
 }
 
 /**
 Creates a new channel.
 */
 pub fn channel<T>() -> (ChannelProducer<T>, ChannelConsumer<T>) {
-    let lock = dlog::perfwarn!("data field may need optimization", {
-        atomiclock_async::AtomicLockAsync::new(Locked::new())
-    });
     let shared = Arc::new(Shared {
-        optimize_data: lock,
+        perfwarn_locked: sync::Mutex::new(Locked {
+            pending_consumer: None,
+            pending_producers: Vec::new(),
+        }),
         consumer_hangup: AtomicBool::new(false),
         producer_hangup: AtomicU8::new(1),
-        pending_consumer_perfwarn: sync::Mutex::new(None),
-        pending_producers_perfwarn: sync::Mutex::new(Vec::new()),
     });
     (ChannelProducer { shared: shared.clone() }, ChannelConsumer { shared })
 }
@@ -88,7 +72,7 @@ pub struct ChannelConsumer<T> {
 }
 
 pub struct ChannelConsumerRecvFuture<'a, T> {
-    future: PollEscape<Result<T,RecvError>>,
+    future: PollEscapeSend<Result<T,RecvError>>,
     inner: &'a mut ChannelConsumer<T>,
 }
 
@@ -97,59 +81,38 @@ impl <'a, T> Future for ChannelConsumerRecvFuture<'a, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         unsafe{self.map_unchecked_mut(|s| &mut s.future)}.poll(cx)
-        // let (sender,receiver) = poll_escape::waker_escape::waker_escape();
-        // let pinned = std::pin::pin!(poll_escape::PollEscape::escape(sender, async {
-        //     if self.inner.shared.producer_hangup.load(Ordering::Relaxed) == 0 {
-        //         return poll_escape::Poll::Ready(Err(RecvError::ProducerHangup));
-        //     }
-        //     let mut lock = self.inner.shared.optimize_data.lock().await;
-        //     if let Some(data) = lock.data.take() {
-        //         //it's ok to pop here because we always insert fresh wakers
-        //         self.inner.shared.pending_producers.wake_one_pop();
-        //         return poll_escape::Poll::Ready(Ok(data));
-        //     }
-        //     else {
-        //         self.inner.shared.pending_consumer.push_if_empty(&receiver.into_waker());
-        //         poll_escape::Poll::Escape
-        //     }
-        // }));
-        // pinned.poll(cx)
+
     }
 }
 
 
-impl<T: 'static> ChannelConsumer<T> {
+impl<T: 'static + Send> ChannelConsumer<T> {
     pub fn receive(&mut self) -> ChannelConsumerRecvFuture<'_, T> {
         let shared = self.shared.clone();
         ChannelConsumerRecvFuture {
             inner: self,
-            future: PollEscape::escape(async move {
-                loop {
-                    let mut lock = shared.optimize_data.lock().await;
-
+            future: PollEscapeSend::escape(async move {
+                //need a dedicated scope to drop lock before we await
+                let future = {
+                    let perf = dlog::perfwarn_begin!("ampsc::perfwarn_locked");
+                    let mut lock = shared.perfwarn_locked.lock().unwrap();
                     if shared.producer_hangup.load(Ordering::Relaxed) == 0 {
                         return Err(RecvError::ProducerHangup);
                     }
-
-                    if let Some(data) = lock.data.take() {
-                        drop(lock);
-                        //wake one pop
-                        shared.pending_producers_perfwarn.lock().unwrap().pop().map(|sender| {
-                            sender.send(Ok(()));
-                        });
-                        return Ok(data);
-                    } else {
-                        drop(lock);
-                        let (sender,future) = continuation::continuation();
-                        perfwarn!("pending_consumer_perfwarn", {
-                        let mut l = shared.pending_consumer_perfwarn.lock().unwrap();
-                        assert!(l.is_none());
-                        *l = Some(sender);
-                    });
-                        future.await; //block until next wakeup
+                    //create a continuation
+                    let (sender,future) = continuation::continuation();
+                    if let Some(p) = lock.pending_producers.pop() {
+                        //provide to producer
+                        p.send(sender);
                     }
-                }
+                    else {
+                        lock.pending_consumer = Some(sender);
+                    }
+                    future
+                };
 
+                //fall out of scope and drop lock
+                future.await
             }),
         }
     }
@@ -158,11 +121,8 @@ impl<T: 'static> ChannelConsumer<T> {
 impl<T> Drop for ChannelConsumer<T> {
     fn drop(&mut self) {
         self.shared.consumer_hangup.store(true, std::sync::atomic::Ordering::Release);
-        perfwarn!("pending_producers_perfwarn", {
-            for producer in self.shared.pending_producers_perfwarn.lock().unwrap().drain(..) {
-                producer.send(Err(SendError::ConsumerHangup));
-            }
-        });
+
+        todo!()
 
     }
 }
@@ -176,7 +136,7 @@ pub struct ChannelProducer<T> {
 #[derive(Debug)]
 pub struct ChannelProducerSendFuture<'a, T> {
     inner: &'a mut ChannelProducer<T>,
-    future: PollEscape<Result<(), SendError>>,
+    future: PollEscapeSend<Result<(), SendError>>,
 }
 
 
@@ -191,37 +151,38 @@ impl<'a, T> Future for ChannelProducerSendFuture<'a, T>
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
        unsafe{self.map_unchecked_mut(|s| &mut s.future)}.poll(cx)
         }
-
-
     }
 
 
 
-impl<T: 'static> ChannelProducer<T> {
+impl<T: Send + 'static> ChannelProducer<T> {
     pub fn send(&mut self, data: T) -> ChannelProducerSendFuture<T> {
         let move_shared = self.shared.clone();
         ChannelProducerSendFuture {
             inner: self,
-            future: PollEscape::escape(async move {
-                let mut lock = move_shared.optimize_data.lock().await;
-                if move_shared.consumer_hangup.load(Ordering::Relaxed) {
-                    return Err(SendError::ConsumerHangup);
-                }
-                else if let Some(_) = lock.data.as_ref() {
-                    drop(lock);
-                    let (sender,future) = continuation::continuation();
-                    perfwarn!("pending_producers_perfwarn", {
-                        move_shared.pending_producers_perfwarn.lock().unwrap().push(sender);
-                    });
-                    return future.await;
-                } else {
-                    lock.data = Some(data);
-                    drop(lock);
-                    move_shared.pending_consumer_perfwarn.lock().unwrap().take().map(|sender| {
-                        sender.send(Ok(()));
-                    });
-                    return Ok(());
-                }
+            future: PollEscapeSend::escape(async move {
+                //need to declare a special scope so we can drop our lock before we await
+                let future = {
+                    let perf = dlog::perfwarn_begin!("ampsc::perfwarn_locked");
+                    let mut lock = move_shared.perfwarn_locked.lock().unwrap();
+                    if move_shared.consumer_hangup.load(Ordering::Relaxed) {
+                        return Err(SendError::ConsumerHangup);
+                    }
+                    if lock.pending_consumer.is_some() {
+                        lock.pending_consumer.take().unwrap().send(Ok(data));
+                        return Ok(())
+                    }
+                    else {
+                        //we need to fall out of this scope so we can drop lock forever.
+                        let (sender, future) = continuation::continuation();
+                        lock.pending_producers.push(sender);
+                        //fall out here and drop our lock
+                        future
+                    }
+                };
+                let upstream_continuation = future.await;
+                upstream_continuation.send(Ok(data));
+                Ok(())
             }),
         }
     }
@@ -256,11 +217,7 @@ impl <T> Drop for ChannelProducer<T> {
     fn drop(&mut self) {
         let old = self.shared.producer_hangup.fetch_sub(1, Ordering::Relaxed);
         if old == 1 {
-            perfwarn!("pending_consumer_perfwarn", {
-                self.shared.pending_consumer_perfwarn.lock().unwrap().take().map(|sender| {
-                    sender.send(Err(RecvError::ProducerHangup));
-                });
-            });
+            todo!()
         }
     }
 }
@@ -268,7 +225,12 @@ impl <T> Drop for ChannelProducer<T> {
 #[test]
 fn test_push() {
     let (mut producer, mut consumer) = channel();
-    afut::block_on::spin_on(producer.send(1)).unwrap();
-    let r = afut::block_on::spin_on(consumer.receive()).unwrap();
+
+    truntime::spawn_on(async move  {
+        let mut producer = producer;
+        producer.send(1).await.unwrap();
+    });
+
+    let r = truntime::spin_on(consumer.receive()).unwrap();
     assert_eq!(r, 1);
 }

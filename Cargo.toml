@@ -13,4 +13,4 @@ continuation = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/continu
 thiserror = "*"
 
 [dev-dependencies]
-afut = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/afut.git"}
+truntime = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/truntime.git"}
