@@ -9,7 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use dlog::perfwarn;
 use poll_escape::PollEscapeSend;
@@ -26,6 +26,25 @@ pub enum RecvError {
     ProducerHangup,
 }
 
+#[derive(Debug)]
+pub struct Hungup<T> {
+    data: Option<T>
+}
+impl<T> Hungup<T> {
+    fn expect_mut(&mut self, reason: &str) -> &mut T {
+        self.data.as_mut().expect(reason)
+    }
+
+    fn new(data: T) -> Self {
+        Hungup {
+            data: Some(data),
+        }
+    }
+
+    fn as_mut(&mut self) -> &mut Option<T> {
+        &mut self.data
+    }
+}
 
 /*
 You might imagine some better datastructure here, like what if we had atomics for insert and remove.
@@ -38,27 +57,26 @@ Problems are.
  */
 #[derive(Debug)]
 pub struct Locked<T> {
-    pending_consumer: Option<continuation::Sender<Result<T,RecvError>>>,
-    pending_producers: Vec<PendingProducer<T>>,
+    pending_consumer: Hungup<Option<continuation::Sender<T>>>,
+    pending_producers: Hungup<Vec<PendingProducer<T>>>,
+
 }
 
 #[derive(Debug)]
 struct Shared<T> {
     //perfwarn - we want a nonblocking lock I think
     perfwarn_locked: sync::Mutex<Locked<T>>,
-    consumer_hangup: AtomicBool,
-    producer_hangup: AtomicU8,
 }
 
 
 #[derive(Debug)]
 struct PendingProducer<T> {
     data: T,
-    continuation: continuation::Sender<Result<(),SendError>>,
+    continuation: continuation::Sender<()>,
 }
 
 impl<T> PendingProducer<T> {
-    fn into_inner(self) -> (T, continuation::Sender<Result<(),SendError>>) {
+    fn into_inner(self) -> (T, continuation::Sender<()>) {
         (self.data, self.continuation)
     }
 }
@@ -71,13 +89,11 @@ Creates a new channel.
 pub fn channel<T>() -> (ChannelProducer<T>, ChannelConsumer<T>) {
     let shared = Arc::new(Shared {
         perfwarn_locked: sync::Mutex::new(Locked {
-            pending_consumer: None,
-            pending_producers: Vec::new(),
+            pending_consumer: Hungup::new(None),
+            pending_producers: Hungup::new(Vec::new()),
         }),
-        consumer_hangup: AtomicBool::new(false),
-        producer_hangup: AtomicU8::new(1),
     });
-    (ChannelProducer { shared: shared.clone() }, ChannelConsumer { shared })
+    (ChannelProducer { shared: shared.clone(), active_producers: Arc::new(AtomicU8::new(1)) }, ChannelConsumer { shared })
 }
 
 #[derive(Debug)]
@@ -110,23 +126,27 @@ impl<T: 'static + Send> ChannelConsumer<T> {
                 let future = {
                     let _perf = dlog::perfwarn_begin!("ampsc::perfwarn_locked");
                     let mut lock = shared.perfwarn_locked.lock().unwrap();
-                    if shared.producer_hangup.load(Ordering::Relaxed) == 0 {
-                        return Err(RecvError::ProducerHangup);
-                    }
-                    if let Some(p) = lock.pending_producers.pop() {
+
+                    if let Some(p) = lock.pending_producers.expect_mut("No pending producers").pop() {
                         let (data, continuation) = p.into_inner();
-                        continuation.send(Ok(()));
+                        continuation.send(());
                         return Ok(data);
                     }
                     else {
-                        let (sender, future) = continuation::continuation();
-                        lock.pending_consumer = Some(sender);
-                        //fall out of scope and drop lock
-                        future
+                        match lock.pending_consumer.as_mut() {
+                            Some(p) => {
+                                let (sender, future) = continuation::continuation();
+                                *p = Some(sender);
+                                future
+                            }
+                            None => {
+                                return Err(RecvError::ProducerHangup);
+                            }
+                        }
                     }
                 };
+                future.await.map_err(|_| RecvError::ProducerHangup)
 
-                future.await
             }),
         }
     }
@@ -134,15 +154,10 @@ impl<T: 'static + Send> ChannelConsumer<T> {
 
 impl<T> Drop for ChannelConsumer<T> {
     fn drop(&mut self) {
-        self.shared.consumer_hangup.store(true, std::sync::atomic::Ordering::Release);
-
         perfwarn!("perfwarn_locked", {
             let mut lock = self.shared.perfwarn_locked.lock().unwrap();
-            for p in lock.pending_producers.drain(..) {
-                p.continuation.send(Err(SendError::ConsumerHangup));
-            }
+            *lock.pending_producers.as_mut() = None;
         });
-
     }
 }
 
@@ -150,6 +165,7 @@ impl<T> Drop for ChannelConsumer<T> {
 #[derive(Debug)]
 pub struct ChannelProducer<T> {
     shared: Arc<Shared<T>>,
+    active_producers: Arc<AtomicU8>,
 }
 
 #[derive(Debug)]
@@ -184,25 +200,30 @@ impl<T: Send + 'static> ChannelProducer<T> {
                 let future = {
                     let _perf = dlog::perfwarn_begin!("ampsc::perfwarn_locked");
                     let mut lock = move_shared.perfwarn_locked.lock().unwrap();
-                    if move_shared.consumer_hangup.load(Ordering::Relaxed) {
-                        return Err(SendError::ConsumerHangup);
+                    match lock.pending_consumer.as_mut() {
+                        Some(maybe_consumer) => {
+                            match maybe_consumer.take() {
+                                Some(consumer) => {
+                                    consumer.send(data);
+                                    return Ok(());
+                                }
+                                None => {
+                                    let (sender, future) = continuation::continuation();
+                                    lock.pending_producers.expect_mut("No pending producers").push(PendingProducer {
+                                        data,
+                                        continuation: sender,
+                                    });
+                                    future
+                                }
+                            }
+                        }
+                        None => {
+                            return Err(SendError::ConsumerHangup);
+                        }
                     }
-                    if lock.pending_consumer.is_some() {
-                        lock.pending_consumer.take().unwrap().send(Ok(data));
-                        return Ok(())
-                    }
-                    else {
-                        let (sender,future) = continuation::continuation();
-                        let pending_producer = PendingProducer {
-                            data,
-                            continuation: sender,
-                        };
-                        lock.pending_producers.push(pending_producer);
-                        //fall out here and drop our lock
-                        future
-                    }
+
                 };
-                future.await
+                future.await.map_err(|_| SendError::ConsumerHangup)
             }),
         }
     }
@@ -226,19 +247,20 @@ boilerplate.
 impl<T> Clone for ChannelProducer<T> {
     fn clone(&self) -> Self {
         //increment the producer hangup count
-        self.shared.producer_hangup.fetch_add(1, Ordering::Relaxed);
+        self.active_producers.fetch_add(1, Ordering::Relaxed);
         ChannelProducer {
             shared: self.shared.clone(),
+            active_producers: self.active_producers.clone(),
         }
     }
 }
 
 impl <T> Drop for ChannelProducer<T> {
     fn drop(&mut self) {
-        let old = self.shared.producer_hangup.fetch_sub(1, Ordering::Relaxed);
+        let old = self.active_producers.fetch_sub(1, Ordering::Relaxed);
         if old == 1 {
             perfwarn!("perfwarn_locked", {
-                self.shared.perfwarn_locked.lock().unwrap().pending_consumer.take().map(|c| c.send(Err(RecvError::ProducerHangup)));
+                self.shared.perfwarn_locked.lock().unwrap().pending_consumer.as_mut().take();
             });
         }
     }
