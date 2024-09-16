@@ -26,6 +26,9 @@ pub enum RecvError {
     ProducerHangup,
 }
 
+/**
+A structure that can be 'hungup' indicating the data is dropped permanently.
+*/
 #[derive(Debug)]
 pub struct Hungup<T> {
     data: Option<T>
@@ -44,6 +47,9 @@ impl<T> Hungup<T> {
     fn as_mut(&mut self) -> &mut Option<T> {
         &mut self.data
     }
+    fn hangup(&mut self) -> T {
+        self.data.take().expect("Already hungup")
+    }
 }
 
 /*
@@ -57,9 +63,8 @@ Problems are.
  */
 #[derive(Debug)]
 pub struct Locked<T> {
-    pending_consumer: Hungup<Option<continuation::Sender<T>>>,
+    pending_consumer: Hungup<Option<continuation::Sender<Result<T,RecvError>>>>,
     pending_producers: Hungup<Vec<PendingProducer<T>>>,
-
 }
 
 #[derive(Debug)]
@@ -72,11 +77,11 @@ struct Shared<T> {
 #[derive(Debug)]
 struct PendingProducer<T> {
     data: T,
-    continuation: continuation::Sender<()>,
+    continuation: continuation::Sender<Result<(),SendError>>,
 }
 
 impl<T> PendingProducer<T> {
-    fn into_inner(self) -> (T, continuation::Sender<()>) {
+    fn into_inner(self) -> (T, continuation::Sender<Result<(),SendError>>) {
         (self.data, self.continuation)
     }
 }
@@ -129,7 +134,7 @@ impl<T: 'static + Send> ChannelConsumer<T> {
 
                     if let Some(p) = lock.pending_producers.expect_mut("No pending producers").pop() {
                         let (data, continuation) = p.into_inner();
-                        continuation.send(());
+                        continuation.send(Ok(()));
                         return Ok(data);
                     }
                     else {
@@ -145,7 +150,7 @@ impl<T: 'static + Send> ChannelConsumer<T> {
                         }
                     }
                 };
-                future.await.map_err(|_| RecvError::ProducerHangup)
+                future.await
 
             }),
         }
@@ -154,10 +159,12 @@ impl<T: 'static + Send> ChannelConsumer<T> {
 
 impl<T> Drop for ChannelConsumer<T> {
     fn drop(&mut self) {
-        perfwarn!("perfwarn_locked", {
-            let mut lock = self.shared.perfwarn_locked.lock().unwrap();
-            *lock.pending_producers.as_mut() = None;
+        let data = perfwarn!("perfwarn_locked", {
+            self.shared.perfwarn_locked.lock().unwrap().pending_producers.hangup()
         });
+        for producer in data {
+            producer.continuation.send(Err(SendError::ConsumerHangup));
+        }
     }
 }
 
@@ -204,7 +211,7 @@ impl<T: Send + 'static> ChannelProducer<T> {
                         Some(maybe_consumer) => {
                             match maybe_consumer.take() {
                                 Some(consumer) => {
-                                    consumer.send(data);
+                                    consumer.send(Ok(data));
                                     return Ok(());
                                 }
                                 None => {
@@ -223,7 +230,7 @@ impl<T: Send + 'static> ChannelProducer<T> {
                     }
 
                 };
-                future.await.map_err(|_| SendError::ConsumerHangup)
+                future.await
             }),
         }
     }
@@ -259,9 +266,14 @@ impl <T> Drop for ChannelProducer<T> {
     fn drop(&mut self) {
         let old = self.active_producers.fetch_sub(1, Ordering::Relaxed);
         if old == 1 {
-            perfwarn!("perfwarn_locked", {
-                self.shared.perfwarn_locked.lock().unwrap().pending_consumer.as_mut().take();
+            let pending_consumer = perfwarn!("perfwarn_locked", {
+                self.shared.perfwarn_locked.lock().unwrap().pending_consumer.hangup()
+
             });
+            if let Some(consumer) = pending_consumer {
+                consumer.send(Err(RecvError::ProducerHangup));
+            }
+
         }
     }
 }
