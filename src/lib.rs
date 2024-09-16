@@ -30,7 +30,7 @@ pub enum RecvError {
 A structure that can be 'hungup' indicating the data is dropped permanently.
 */
 #[derive(Debug)]
-pub struct Hungup<T> {
+struct Hungup<T> {
     data: Option<T>
 }
 impl<T> Hungup<T> {
@@ -85,8 +85,6 @@ impl<T> PendingProducer<T> {
         (self.data, self.continuation)
     }
 }
-
-
 
 /**
 Creates a new channel.
