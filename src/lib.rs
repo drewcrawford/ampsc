@@ -1,8 +1,9 @@
 /*!
-A multi-producer, single-consumer async stream channel.
+It's an **a**sync **m**ulti-**p**roducer **s**ingle-**c**onsumer channel (ampsc).
 
-This channel guarantees reliable delivery.  If you can live with alternate guarantees, you probably
-mean to target a different API.
+This crate is completely async-agnostic.
+
+
 */
 
 use std::fmt::Debug;
@@ -13,14 +14,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use logwise::perfwarn;
-
+/**
+Errors during sending */
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum SendError {
     #[error("The consumer has hung up")]
     ConsumerHangup,
 }
 
+/**
+Errors during receiving */
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum RecvError {
     #[error("The producer has hung up")]
     ProducerHangup,
@@ -99,11 +105,17 @@ pub fn channel<T>() -> (ChannelProducer<T>, ChannelConsumer<T>) {
     (ChannelProducer { shared: shared.clone(), active_producers: Arc::new(AtomicU8::new(1)) }, ChannelConsumer { shared })
 }
 
+/**
+A consumer for a channel.
+*/
 #[derive(Debug)]
 pub struct ChannelConsumer<T> {
     shared: Arc<Shared<T>>,
 }
 
+/**
+A future that represents an in-flight recieve operation.
+*/
 pub struct ChannelConsumerRecvFuture<'a, T> {
     future: Box<dyn Future<Output=Result<T,RecvError>> + Send>,
     _inner: &'a mut ChannelConsumer<T>,
@@ -120,6 +132,9 @@ impl <'a, T> Future for ChannelConsumerRecvFuture<'a, T> {
 
 
 impl<T: 'static + Send> ChannelConsumer<T> {
+    /**
+    Receives a message from the channel.
+    */
     pub fn receive(&mut self) -> ChannelConsumerRecvFuture<'_, T> {
         let shared = self.shared.clone();
         ChannelConsumerRecvFuture {
@@ -167,12 +182,18 @@ impl<T> Drop for ChannelConsumer<T> {
 }
 
 
+/**
+The producer (send-side) for a [channel].
+*/
 #[derive(Debug)]
 pub struct ChannelProducer<T> {
     shared: Arc<Shared<T>>,
     active_producers: Arc<AtomicU8>,
 }
 
+/**
+A future that represents an in-flight send operation.
+*/
 pub struct ChannelProducerSendFuture<'a, T> {
     inner: &'a mut ChannelProducer<T>,
     future: Box<dyn Future<Output=Result<(),SendError>> + Send>,
@@ -201,6 +222,9 @@ impl<'a, T> Future for ChannelProducerSendFuture<'a, T>
 
 
 impl<T: Send + 'static> ChannelProducer<T> {
+    /**
+    Sends a message into the channel.
+*/
     pub fn send(&mut self, data: T) -> ChannelProducerSendFuture<T> {
         let move_shared = self.shared.clone();
         ChannelProducerSendFuture {
