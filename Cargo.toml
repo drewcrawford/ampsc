@@ -10,7 +10,7 @@ homepage = "https://sealedabstract.com/code/ampsc"
 repository = "https://github.com/drewcrawford/ampsc"
 keywords = ["concurrency", "async", "channel"]
 categories = ["asynchronous", "concurrency", "rust-patterns" ]
-
+exclude = [".*"]
 [dependencies]
 logwise = {version = "~0"}
 continue = "~0"
