@@ -63,7 +63,7 @@ Problems are.
  */
 #[derive(Debug)]
 pub struct Locked<T> {
-    pending_consumer: Hungup<Option<continuation::Sender<Result<T,RecvError>>>>,
+    pending_consumer: Hungup<Option<r#continue::Sender<Result<T,RecvError>>>>,
     pending_producers: Hungup<Vec<PendingProducer<T>>>,
 }
 
@@ -77,11 +77,11 @@ struct Shared<T> {
 #[derive(Debug)]
 struct PendingProducer<T> {
     data: T,
-    continuation: continuation::Sender<Result<(),SendError>>,
+    continuation: r#continue::Sender<Result<(),SendError>>,
 }
 
 impl<T> PendingProducer<T> {
-    fn into_inner(self) -> (T, continuation::Sender<Result<(),SendError>>) {
+    fn into_inner(self) -> (T, r#continue::Sender<Result<(),SendError>>) {
         (self.data, self.continuation)
     }
 }
@@ -138,7 +138,7 @@ impl<T: 'static + Send> ChannelConsumer<T> {
                     else {
                         match lock.pending_consumer.as_mut() {
                             Some(p) => {
-                                let (sender, future) = continuation::continuation();
+                                let (sender, future) = r#continue::continuation();
                                 *p = Some(sender);
                                 future
                             }
@@ -218,7 +218,7 @@ impl<T: Send + 'static> ChannelProducer<T> {
                                     return Ok(());
                                 }
                                 None => {
-                                    let (sender, future) = continuation::continuation();
+                                    let (sender, future) = r#continue::continuation();
                                     lock.pending_producers.expect_mut("Pending producers hungup").push(PendingProducer {
                                         data,
                                         continuation: sender,
@@ -285,11 +285,11 @@ impl <T> Drop for ChannelProducer<T> {
 fn test_push() {
     let (producer, mut consumer) = channel();
 
-    truntime::spawn_on(async move  {
+    test_executors::spawn_on("test_push_thread",async move  {
         let mut producer = producer;
         producer.send(1).await.unwrap();
     });
 
-    let r = truntime::spin_on(consumer.receive()).unwrap();
+    let r = test_executors::spin_on(consumer.receive()).unwrap();
     assert_eq!(r, 1);
 }

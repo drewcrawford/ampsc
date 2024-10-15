@@ -5,9 +5,9 @@ edition = "2021"
 
 [dependencies]
 logwise = {version = "~0"}
-continuation = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/continuation.git"}
+continue = "~0"
 
 thiserror = "*"
 
 [dev-dependencies]
-truntime = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/truntime.git"}
+test_executors = "~0"
