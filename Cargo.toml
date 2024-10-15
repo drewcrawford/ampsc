@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-dlog = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/dlog.git"}
-poll_escape = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/poll_escape.git"}
+logwise = {version = "~0"}
 continuation = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/continuation.git"}
 
 thiserror = "*"

@@ -5,14 +5,14 @@ This channel guarantees reliable delivery.  If you can live with alternate guara
 mean to target a different API.
 */
 
+use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
-use dlog::perfwarn;
-use poll_escape::PollEscapeSend;
+use logwise::perfwarn;
 
 #[derive(thiserror::Error, Debug)]
 pub enum SendError {
@@ -105,7 +105,7 @@ pub struct ChannelConsumer<T> {
 }
 
 pub struct ChannelConsumerRecvFuture<'a, T> {
-    future: PollEscapeSend<Result<T,RecvError>>,
+    future: Box<dyn Future<Output=Result<T,RecvError>> + Send>,
     _inner: &'a mut ChannelConsumer<T>,
 }
 
@@ -113,7 +113,7 @@ impl <'a, T> Future for ChannelConsumerRecvFuture<'a, T> {
     type Output = Result<T,RecvError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        unsafe{self.map_unchecked_mut(|s| &mut s.future)}.poll(cx)
+        unsafe{self.map_unchecked_mut(|s| Box::as_mut(&mut s.future))}.poll(cx)
 
     }
 }
@@ -124,13 +124,13 @@ impl<T: 'static + Send> ChannelConsumer<T> {
         let shared = self.shared.clone();
         ChannelConsumerRecvFuture {
             _inner: self,
-            future: PollEscapeSend::escape(async move {
+            future:Box::new(async move {
                 //need a dedicated scope to drop lock before we await
                 let future = {
-                    let _perf = dlog::perfwarn_begin!("ampsc::perfwarn_locked");
+                    let _perf = logwise::perfwarn_begin!("ampsc::perfwarn_locked");
                     let mut lock = shared.perfwarn_locked.lock().unwrap();
 
-                    if let Some(p) = lock.pending_producers.expect_mut("No pending producers").pop() {
+                    if let Some(p) = lock.pending_producers.expect_mut("Pending producers hungup").pop() {
                         let (data, continuation) = p.into_inner();
                         continuation.send(Ok(()));
                         return Ok(data);
@@ -173,14 +173,19 @@ pub struct ChannelProducer<T> {
     active_producers: Arc<AtomicU8>,
 }
 
-#[derive(Debug)]
 pub struct ChannelProducerSendFuture<'a, T> {
-    _inner: &'a mut ChannelProducer<T>,
-    future: PollEscapeSend<Result<(), SendError>>,
+    inner: &'a mut ChannelProducer<T>,
+    future: Box<dyn Future<Output=Result<(),SendError>> + Send>,
 }
 
 
-
+impl Debug for ChannelProducerSendFuture<'_, ()> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelProducerSendFuture")
+            .field("_inner", self.inner)
+            .finish()
+    }
+}
 
 
 
@@ -189,7 +194,7 @@ impl<'a, T> Future for ChannelProducerSendFuture<'a, T>
     type Output = Result<(), SendError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-       unsafe{self.map_unchecked_mut(|s| &mut s.future)}.poll(cx)
+        unsafe{self.map_unchecked_mut(|s| Box::as_mut(&mut s.future))}.poll(cx)
         }
     }
 
@@ -199,11 +204,11 @@ impl<T: Send + 'static> ChannelProducer<T> {
     pub fn send(&mut self, data: T) -> ChannelProducerSendFuture<T> {
         let move_shared = self.shared.clone();
         ChannelProducerSendFuture {
-            _inner: self,
-            future: PollEscapeSend::escape(async move {
+            inner: self,
+            future: Box::new(async move {
                 //need to declare a special scope so we can drop our lock before we await
                 let future = {
-                    let _perf = dlog::perfwarn_begin!("ampsc::perfwarn_locked");
+                    let _perf = logwise::perfwarn_begin!("ampsc::perfwarn_locked");
                     let mut lock = move_shared.perfwarn_locked.lock().unwrap();
                     match lock.pending_consumer.as_mut() {
                         Some(maybe_consumer) => {
@@ -214,7 +219,7 @@ impl<T: Send + 'static> ChannelProducer<T> {
                                 }
                                 None => {
                                     let (sender, future) = continuation::continuation();
-                                    lock.pending_producers.expect_mut("No pending producers").push(PendingProducer {
+                                    lock.pending_producers.expect_mut("Pending producers hungup").push(PendingProducer {
                                         data,
                                         continuation: sender,
                                     });
