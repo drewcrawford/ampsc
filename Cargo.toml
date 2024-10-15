@@ -1,13 +1,21 @@
 [package]
 name = "ampsc"
 version = "0.1.0"
+authors = ["Drew Crawford <drew@sealedabstract.com>"]
+rust-version = "1.75.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "async multi-producer single-consumer channel"
+homepage = "https://sealedabstract.com/code/ampsc"
+repository = "https://github.com/drewcrawford/ampsc"
+keywords = ["concurrency", "async", "channel"]
+categories = ["asynchronous", "concurrency", "rust-patterns" ]
 
 [dependencies]
 logwise = {version = "~0"}
 continue = "~0"
 
-thiserror = "*"
+thiserror = "~1"
 
 [dev-dependencies]
 test_executors = "~0"

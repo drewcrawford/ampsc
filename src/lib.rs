@@ -1,13 +1,14 @@
+//SPDX-License-Identifier: MIT OR Apache-2.0
 /*!
+![logo](art/logo.png)
 It's an **a**sync **m**ulti-**p**roducer **s**ingle-**c**onsumer channel (ampsc).
 
-This crate is completely async-agnostic.
-
-
+This crate is completely executor-agnostic.
 */
 
 use std::fmt::Debug;
 use std::future::Future;
+
 use std::pin::Pin;
 use std::sync;
 use std::sync::Arc;
