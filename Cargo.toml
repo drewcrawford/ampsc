@@ -14,8 +14,8 @@ exclude = [".*"]
 [dependencies]
 logwise = {version = "~0"}
 continue = "~0"
-
 thiserror = "~1"
+atomiclock_async = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/atomiclock_async.git"}
 
 [dev-dependencies]
 test_executors = "~0"

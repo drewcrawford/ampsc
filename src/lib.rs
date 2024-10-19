@@ -3,18 +3,22 @@
 ![logo](art/logo.png)
 It's an **a**sync **m**ulti-**p**roducer **s**ingle-**c**onsumer channel (ampsc).
 
+This is the opposite of an [ampsc](https://crates.io/crates/ampsc) channel.
+It's also the opposite of an [ampmc](https://crates.io/crates/ampmc) channel.
+
 This crate is completely executor-agnostic.
 */
+
+
 
 use std::fmt::Debug;
 use std::future::Future;
 
 use std::pin::Pin;
-use std::sync;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
-use logwise::perfwarn;
+use atomiclock_async::AtomicLockAsync;
 /**
 Errors during sending */
 #[derive(thiserror::Error, Debug)]
@@ -54,9 +58,26 @@ impl<T> Hungup<T> {
     fn as_mut(&mut self) -> &mut Option<T> {
         &mut self.data
     }
+    /**
+    If the value is not hungup, replaces the value with the replacement and returns the old value.
+
+    If the value is hungup, returns None, dropping the replacement value.
+    */
+    fn replace_if_needed(&mut self, replacement: T) -> Option<T> {
+        if let Some(data) = &mut self.data {
+            let mut replacement = replacement;
+            std::mem::swap(data, &mut replacement);
+            Some(replacement)
+        }
+        else {
+            None
+        }
+    }
     fn hangup(&mut self) -> T {
         self.data.take().expect("Already hungup")
     }
+
+
 }
 
 /*
@@ -69,7 +90,7 @@ Problems are.
 3.  So maybe it occurs to you to use backpressure to store the spill.  But then you're trying to implement a channel in terms of a channel, which is a bit of a problem.
  */
 #[derive(Debug)]
-pub struct Locked<T> {
+struct Locked<T> {
     pending_consumer: Hungup<Option<r#continue::Sender<Result<T,RecvError>>>>,
     pending_producers: Hungup<Vec<PendingProducer<T>>>,
 }
@@ -77,7 +98,7 @@ pub struct Locked<T> {
 #[derive(Debug)]
 struct Shared<T> {
     //perfwarn - we want a nonblocking lock I think
-    perfwarn_locked: sync::Mutex<Locked<T>>,
+    lock: atomiclock_async::AtomicLockAsync<Locked<T>>,
 }
 
 
@@ -98,20 +119,21 @@ Creates a new channel.
 */
 pub fn channel<T>() -> (ChannelProducer<T>, ChannelConsumer<T>) {
     let shared = Arc::new(Shared {
-        perfwarn_locked: sync::Mutex::new(Locked {
+        lock: AtomicLockAsync::new(Locked {
             pending_consumer: Hungup::new(None),
             pending_producers: Hungup::new(Vec::new()),
         }),
     });
-    (ChannelProducer { shared: shared.clone(), active_producers: Arc::new(AtomicU8::new(1)) }, ChannelConsumer { shared })
+    (ChannelProducer { shared: shared.clone(), active_producers: Arc::new(AtomicU8::new(1)), async_dropped: false}, ChannelConsumer { shared, async_dropped: false })
 }
 
 /**
-A consumer for a channel.
+A consumer (recv-side) for a channel.
 */
 #[derive(Debug)]
 pub struct ChannelConsumer<T> {
     shared: Arc<Shared<T>>,
+    async_dropped: bool,
 }
 
 /**
@@ -143,8 +165,7 @@ impl<T: 'static + Send> ChannelConsumer<T> {
             future:Box::new(async move {
                 //need a dedicated scope to drop lock before we await
                 let future = {
-                    let _perf = logwise::perfwarn_begin!("ampsc::perfwarn_locked");
-                    let mut lock = shared.perfwarn_locked.lock().unwrap();
+                    let mut lock = shared.lock.lock().await;
 
                     if let Some(p) = lock.pending_producers.expect_mut("Pending producers hungup").pop() {
                         let (data, continuation) = p.into_inner();
@@ -169,16 +190,23 @@ impl<T: 'static + Send> ChannelConsumer<T> {
             }),
         }
     }
+
+    pub async fn async_drop(&mut self) {
+        assert!(!self.async_dropped);
+        let mut lock = self.shared.lock.lock().await;
+        lock.pending_consumer.hangup();
+        if let Some(producers) = lock.pending_producers.replace_if_needed(Vec::new()) {
+            for producer in producers {
+                producer.continuation.send(Err(SendError::ConsumerHangup));
+            }
+        }
+        self.async_dropped = true;
+    }
 }
 
 impl<T> Drop for ChannelConsumer<T> {
     fn drop(&mut self) {
-        let data = perfwarn!("perfwarn_locked", {
-            self.shared.perfwarn_locked.lock().unwrap().pending_producers.hangup()
-        });
-        for producer in data {
-            producer.continuation.send(Err(SendError::ConsumerHangup));
-        }
+        assert!(self.async_dropped, "You must call async_drop on the consumer before dropping it");
     }
 }
 
@@ -190,6 +218,7 @@ The producer (send-side) for a [channel].
 pub struct ChannelProducer<T> {
     shared: Arc<Shared<T>>,
     active_producers: Arc<AtomicU8>,
+    async_dropped: bool,
 }
 
 /**
@@ -217,15 +246,15 @@ impl<'a, T> Future for ChannelProducerSendFuture<'a, T>
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         unsafe{self.map_unchecked_mut(|s| Box::as_mut(&mut s.future))}.poll(cx)
-        }
     }
+}
 
 
 
 impl<T: Send + 'static> ChannelProducer<T> {
     /**
     Sends a message into the channel.
-*/
+    */
     pub fn send(&mut self, data: T) -> ChannelProducerSendFuture<T> {
         let move_shared = self.shared.clone();
         ChannelProducerSendFuture {
@@ -233,8 +262,7 @@ impl<T: Send + 'static> ChannelProducer<T> {
             future: Box::new(async move {
                 //need to declare a special scope so we can drop our lock before we await
                 let future = {
-                    let _perf = logwise::perfwarn_begin!("ampsc::perfwarn_locked");
-                    let mut lock = move_shared.perfwarn_locked.lock().unwrap();
+                    let mut lock = move_shared.lock.lock().await;
                     match lock.pending_consumer.as_mut() {
                         Some(maybe_consumer) => {
                             match maybe_consumer.take() {
@@ -262,6 +290,23 @@ impl<T: Send + 'static> ChannelProducer<T> {
             }),
         }
     }
+
+    pub async fn async_drop(&mut self) {
+        assert!(!self.async_dropped);
+        let old = self.active_producers.fetch_sub(1, Ordering::Relaxed);
+        if old == 1 {
+            let mut lock = self.shared.lock.lock().await;
+            let old = lock.pending_producers.hangup();
+            assert!(old.is_empty());
+            if let Some(consumer) = lock.pending_consumer.replace_if_needed(None) {
+                if let Some(consumer) = consumer {
+                    consumer.send(Err(RecvError::ProducerHangup));
+                }
+            }
+        }
+        self.async_dropped = true;
+
+    }
 }
 
 /*
@@ -282,39 +327,35 @@ boilerplate.
 impl<T> Clone for ChannelProducer<T> {
     fn clone(&self) -> Self {
         //increment the producer hangup count
-        self.active_producers.fetch_add(1, Ordering::Relaxed);
         ChannelProducer {
             shared: self.shared.clone(),
             active_producers: self.active_producers.clone(),
+            async_dropped: false,
         }
     }
 }
 
 impl <T> Drop for ChannelProducer<T> {
     fn drop(&mut self) {
-        let old = self.active_producers.fetch_sub(1, Ordering::Relaxed);
-        if old == 1 {
-            let pending_consumer = perfwarn!("perfwarn_locked", {
-                self.shared.perfwarn_locked.lock().unwrap().pending_consumer.hangup()
-
-            });
-            if let Some(consumer) = pending_consumer {
-                consumer.send(Err(RecvError::ProducerHangup));
-            }
-
-        }
+        assert!(self.async_dropped, "You must call async_drop on the producer before dropping it");
     }
 }
 
 #[test]
 fn test_push() {
+    logwise::context::Context::reset("test_push");
     let (producer, mut consumer) = channel();
 
     test_executors::spawn_on("test_push_thread",async move  {
         let mut producer = producer;
         producer.send(1).await.unwrap();
+        producer.async_drop().await;
     });
 
     let r = test_executors::spin_on(consumer.receive()).unwrap();
     assert_eq!(r, 1);
+
+    test_executors::spin_on(consumer.async_drop());
+    logwise::context::Context::reset("finished");
 }
+
