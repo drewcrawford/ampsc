@@ -207,7 +207,9 @@ impl<T: 'static + Send> ChannelConsumer<T> {
 
 impl<T> Drop for ChannelConsumer<T> {
     fn drop(&mut self) {
-        assert!(self.async_dropped, "You must call async_drop on the consumer before dropping it");
+        if !std::thread::panicking() {
+            assert!(self.async_dropped, "You must call async_drop on the consumer before dropping it");
+        }
     }
 }
 
@@ -340,7 +342,9 @@ impl<T> Clone for ChannelProducer<T> {
 
 impl <T> Drop for ChannelProducer<T> {
     fn drop(&mut self) {
-        assert!(self.async_dropped, "You must call async_drop on the producer before dropping it");
+        if !std::thread::panicking() {
+            assert!(self.async_dropped, "You must call async_drop on the producer before dropping it");
+        }
     }
 }
 
