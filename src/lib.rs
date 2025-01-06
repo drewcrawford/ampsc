@@ -332,6 +332,7 @@ boilerplate.
 impl<T> Clone for ChannelProducer<T> {
     fn clone(&self) -> Self {
         //increment the producer hangup count
+        self.active_producers.fetch_add(1, Ordering::SeqCst);
         ChannelProducer {
             shared: self.shared.clone(),
             active_producers: self.active_producers.clone(),
