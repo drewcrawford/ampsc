@@ -196,6 +196,7 @@ impl<T: 'static + Send> ChannelConsumer<T> {
         let mut lock = self.shared.lock.lock().await;
         lock.pending_consumer.hangup();
         if let Some(producers) = lock.pending_producers.replace_if_needed(Vec::new()) {
+            drop(lock);
             for producer in producers {
                 producer.continuation.send(Err(SendError::ConsumerHangup));
             }
@@ -293,12 +294,14 @@ impl<T: Send + 'static> ChannelProducer<T> {
 
     pub async fn async_drop(&mut self) {
         assert!(!self.async_dropped);
-        let old = self.active_producers.fetch_sub(1, Ordering::Relaxed);
+        let old = self.active_producers.fetch_sub(1, Ordering::SeqCst);
+        logwise::warn_sync!("old {old}",old=old);
         if old == 1 {
             let mut lock = self.shared.lock.lock().await;
             let old = lock.pending_producers.hangup();
             assert!(old.is_empty());
             if let Some(consumer) = lock.pending_consumer.replace_if_needed(None) {
+                drop(lock);
                 if let Some(consumer) = consumer {
                     consumer.send(Err(RecvError::ProducerHangup));
                 }
