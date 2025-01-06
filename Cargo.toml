@@ -12,10 +12,10 @@ keywords = ["concurrency", "async", "channel"]
 categories = ["asynchronous", "concurrency", "rust-patterns" ]
 exclude = [".*"]
 [dependencies]
-logwise = {version = "~0"}
-continue = "~0"
+logwise = {version = "0.2"}
+continue = "0.1"
 thiserror = "~1"
-atomiclock_async = {git = "ssh://gitea@gitea.mermaid-gecko.ts.net/Metropolis/atomiclock_async.git"}
+atomiclock_async = "0.1.0"
 
 [dev-dependencies]
-test_executors = "~0"
+test_executors = "0.3"
