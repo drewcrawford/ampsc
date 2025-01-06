@@ -1,6 +1,6 @@
 [package]
 name = "ampsc"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Drew Crawford <drew@sealedabstract.com>"]
 rust-version = "1.75.0"
 edition = "2021"
